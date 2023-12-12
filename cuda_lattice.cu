@@ -239,20 +239,1374 @@ __global__ void ker_dzu_dzsu(
   }
 }
 
-// typedef void (*QED_kernel_LX_ptr)( const double xv[4], const double yv[4], const struct QED_kernel_temps t, double kerv[6][4][4][4] );
+
+
+// scalar product of two four-vectors
+__device__
+static inline double
+SCALPROD( const double xv[4] ,
+	  const double yv[4] )
+{
+  return xv[0]*yv[0] + xv[1]*yv[1] + xv[2]*yv[2] + xv[3]*yv[3] ;
+}
+
+// little helper function
+__device__
+static inline double
+lerp( const double a ,
+      const double T1 ,
+      const double T2 )
+{
+  return a*T1 + (1.0-a)*T2 ;
+}
+
+__device__
+double
+chebUsum( const int nk ,
+	  const double x ,
+	  const double *co )
+{
+  double ya=0.0;
+  double yb=0.0;
+  const double twox = 2.0*x;
+  double ytmp ;
+  int j;
+  for(j=nk-1;j>0;j--) {
+    ytmp = yb;
+    yb = twox*yb - ya + co[j];
+    ya = ytmp;
+  }
+  return(-ya + twox*yb + co[0]);
+}
+
+// Clenshaw for Sum[co[k]*Derivative[0,1][ChebyshevU][k,x],{k,0,nk-1}]
+// alf(n,z) = 2z(n+1)/n       beta(n,z) = -(n+2)/n
+// y_k = alf(k,x)*y_{k+1} + beta(k+1,x)*y_{k+2} + co[k]
+__device__
+double
+dchebUsum( const int nk ,
+	   const double x,
+	   const double *co)
+{
+  double ya=0.0;
+  double yb=0.0;
+  const double twox = 2.0*x;
+  double ytmp ;
+  int j ;
+  for(j=nk-1;j>0;j--) {
+    ytmp = yb;
+    yb = twox*(j+1)*yb/j - (j+3)*ya/(j+1) + co[j];
+    ya = ytmp;
+  }
+  return(2.0*yb);
+}
+
+// Clenshaw for Sum[co[k]*Derivative[0,2][ChebyshevU][k,x],{k,0,nk-1}]
+// alf(n,z) = 2z(n+1)/(n-1)       beta(n,z) = -(n+3)/(n-1)
+__device__
+double
+ddchebUsum( const int nk,
+	    const double x,
+	    const double *co)
+{
+  double ya=0.0;
+  double yb=0.0;
+  const double twox = 2.0*x;
+  double ytmp ;
+  int j ;
+  for(j=nk-1;j>1;j--) {
+    ytmp = yb;
+    yb = twox*(j+1)*yb/(j-1) ;
+    yb -= (j+4)*ya/j ;
+    yb += co[j];
+    ya = ytmp;
+  }
+  return 8*yb ;
+}
+
+// Clenshaw for Sum[co[k]*Derivative[0,3][ChebyshevU][k,x],{k,0,nk-1}]
+// alf(n,z) = 2z(n+1)/(n-2)       beta(n,z) = -(n+4)/(n-2)
+__device__
+double
+dddchebUsum( const int nk ,
+	     const double x ,
+	     const double *co )
+{
+  double ya=0.0;
+  double yb=0.0;
+  const double twox = 2.0*x;
+  double ytmp ;
+  int j ;
+  for(j=nk-1;j>2;j--) {
+    ytmp = yb;
+    yb = twox*(j+1)*yb/(j-2) - (j+5)*ya/(j-1) + co[j];
+    ya = ytmp;
+  }
+  return 48*yb ;
+}
+
+// interpolation function
+// dy should be set to y1-y2
+__device__
+static inline double
+interpol3( const double y ,
+	   const double y1 ,
+	   const double y2 ,
+	   const double dy ,
+	   const double f1 ,
+	   const double f2 ,
+	   const double g1 ,
+	   const double g2 )
+{
+  return ((-f1* (y - y2)*(y - y2)*(2* y - 3* y1 + y2) +
+	   (y - y1)* (f2* (y - y1)*(2* y + y1 - 3* y2)
+		      + (y - y2)*dy* (g1* y + g2* y - g2* y1 - g1* y2)))/(dy*dy*dy)) ;
+}
+
+// precompute all this business for x or y
+__device__
+void
+precompute_INV( struct intprecomp *INVy ,
+		const double y ,
+		const double y1 ,
+		const double y2 ,
+		const size_t idx )
+{
+  INVy -> idx = idx ;
+  const double dy = y1-y2 ;
+  const double ymy1 = y-y1 ;
+  const double ymy2 = y-y2 ;
+  const double ym2sq = (ymy2*ymy2) ;
+  const double ym1sq = (ymy1*ymy1) ;
+  INVy -> A = -(ym2sq)*(2*y - 3*y1 + y2) ;
+  INVy -> B = (ym1sq)*(2*y + y1 - 3*y2) ;
+  INVy -> C1 = (ymy1)*(ym2sq)*dy ;
+  INVy -> C2 = (ym1sq)*(ymy2)*dy ;
+  INVy -> D = 1./(dy*dy*dy) ;
+  INVy -> lA = (y2-y)/(y2-y1) ;
+}
+
+__device__
+static inline double
+interpol4( const struct intprecomp& INVx ,
+	   const double f1 ,
+	   const double f2 ,
+	   const double g1 ,
+	   const double g2 )
+{
+  return (f1*INVx.A + f2*INVx.B + g1*INVx.C1 + g2*INVx.C2)*INVx.D ; 
+}
+
+// function pointer for cheby stuff
+// static double (*Func_usm[4])( const int , const double , const double *) =
+// { chebUsum , dchebUsum , ddchebUsum , dddchebUsum } ;
+__device__
+static double Func_usm( const int i,
+    const int n, const double x, const double *f ) {
+  switch(i) {
+    case 0: return chebUsum(n, x, f);
+    case 1: return dchebUsum(n, x, f);
+    case 2: return ddchebUsum(n, x, f);
+    case 3: return dddchebUsum(n, x, f);
+    default: return 0.0;
+  }
+}
+
+// returns the form factor, given the coefficients fm[0..(nf-1)] and fp[0..(nf-1)]
+// e.g. fm = alpha^{(3)}_{m-}  and fp = alpha^{(3)}_{m+}
+// nf = length of vectors fm[nm][ix/iy] and similarly for fp
+// nm = index of the sum sigma that appeared in the integrand == outer index of ff
+// ndy and ndcb = # derivatives with respect to y and cos(beta) respectively
+// x is not used in this function
+__device__
+static void
+getff2( double res[2] ,
+	const int nf, const FFidx nm ,
+	const bool ndy , const NDCB ndcb, 
+	const double y, const double x ,
+	const float *fm, const float *fp )
+{
+  const double y1 = 1.0/y;
+
+  // enum guarantees these are set but avoid stupid
+  // gcc maybe unitialized warning
+  double yp = 1 ;
+  int mshm = 2 ;
+  switch(nm) {
+  case QG0    : case dxQG0 : yp = 1.0   ; mshm=2 ; break;
+  case QG1    : case dxQG1 : yp = 1.0   ; mshm=2 ; break;
+  case QG2    : case dxQG2 : case d2xQG2: yp =  y1 ; mshm=3 ; break;
+  case QG3    : case dxQG3 : case d2xQG3: yp = 1.0 ; mshm=2 ; break;
+  case QL4    : case dxQL4 : yp =   y   ; mshm=1 ; break;
+  case QL2    : case dxQL2 : yp = y1*y1 ; mshm=4 ; break;
+  }
+
+  // these two parameters are simply related to mshm
+  int mshp = 2 - mshm ;
+  // mm used to be set by the global map Idm, but that was unnecessary
+  const int mm = abs( mshp ) ;
+
+  // set fval to zero, actually not really needed
+  double fval[128], fvalD[128];
+  // TODO: do something more reasonable if too long
+  if (nf+mm >= 128) return;
+  memset( fval , 0 , (nf+mm)*sizeof( double ) ) ;
+  memset( fvalD , 0 , (nf+mm)*sizeof( double ) ) ;
+  double facm = y1*y1*yp ;
+  double facp = yp ;
+
+  for(int j = 0 ; j < mm ; j++ ) {
+    facm *= y1 ;
+    facp *= y ;
+  }
+
+  // double *Pfval = (double*)fval + mm ;
+  // double *PfvalD = (double*)fvalD + mm ;
+
+  mshm += mm ; mshp += mm ;
+  for(int j = 0; j < nf; j++) {
+    fvalD[mm + j] = y1*mshp*facp*__ldg(fp + j) - y1*mshm*facm*__ldg(fm + j) ;
+    fval[mm + j] = facm*__ldg(fm) + facp*__ldg(fp) ;
+    facm *= y1; facp *= y;    
+    mshm++ ; mshp++ ;
+  }
+
+  res[1] = Func_usm(mm + ndcb, nf+mm, x , fvalD ) ;
+  res[0] = ndy? res[1] : Func_usm(mm + ndcb, nf+mm, x , fval ) ;
+}
+
+// case where you have read in the weight functions upon initialization
+// interpolates the form factor[nm] to the target point y using the grid
+__device__
+double
+accessv( const bool flag_hy, const bool use_y_derivs,
+	 const int ix, const int iy,
+	 const FFidx nm, const bool ndy, const NDCB ndcb,
+	 const double cb, const double y, 
+	 const struct Grid_coeffs& Grid )
+{
+  const int nx = __ldg(Grid.nfx+ix) ;
+  const double y1 = __ldg(Grid.YY+iy);
+  double res1[2] = {0.,0.} ;
+    
+  // occasionally ndy gets set to 1, if use_y_derivs is set we always do the deriv
+  getff2( res1 , nx, nm, ndy, ndcb, y1, cb,
+	  getFfm(&Grid, nm, ix, iy) , getFfp(&Grid, nm, ix, iy) ) ;
+  
+  // if we are not at the upper limit of Y we can use info from the next point
+  if(!flag_hy) {
+    const int iy2 = iy+1;
+    const double y2 = __ldg(Grid.YY+iy2);
+    double res2[2] = {0.,0.} ;
+
+    getff2( res2 , nx, nm, ndy, ndcb, y2, cb,
+	    getFfm(&Grid, nm, ix, iy2) ,
+	    getFfp(&Grid, nm, ix, iy2) ) ;
+    
+    if( use_y_derivs ) {
+      return interpol3( y, y1, y2, y1-y2,
+			res1[0], res2[0], res1[1], res2[1] ) ;      
+    } else {
+      // value interpolated to target y, at x=x1[0];
+      return lerp( (y2-y)/(y2-y1) , res1[0] , res2[0] ) ;
+    }
+  }
+  return res1[0] ;
+}
+
+// linear search variant targeted at avoiding warp divergence and keeping
+// regular memory access on CUDA.
+__device__
+static int
+lsrch( const double *arr, const double target,
+    const int lo, const int hi ) {
+  int index = lo;
+  for (int i = lo; i < hi; ++i) {
+    index = (__ldg(arr+i) <= target && target <= __ldg(arr+i+1)) ? i : index;
+  }
+  return index;
+}
+
+// returns the lower index that bounds "target"
+// e.g arr[lo] < target < arr[lo+1]
+// (assumes a monotonically increasing arr)
+__device__
+inline int
+find_ind(const double *arr, const double target,
+    const int lo, const int hi) {
+  return lsrch(arr, target, lo, hi);
+}
+
+// extract the form factor
+__device__
+double
+extractff( const FFidx nm, const bool ndy, const NDCB ndcb,
+	   const struct invariants& Inv , const struct Grid_coeffs& Grid )
+{  
+  const bool flag_hx = ( Inv.x >= __ldg(Grid.XX + Grid.nstpx-1) ) ;
+  const bool flag_hy = ( Inv.y >= __ldg(Grid.YY + Grid.nstpy-1) ) ;
+ 
+  const bool use_x_derivs = (nm<dxQG0 || nm==dxQG2 || nm==dxQG3) ;
+
+  const int ix = Inv.INVx.idx , iy = Inv.INVy.idx ; 
+  const bool use_y_derivs = (ndy==false) ;
+  const double f1iy = accessv( flag_hy, use_y_derivs, ix, iy, nm,
+			       ndy, ndcb, Inv.cb, Inv.y, Grid ) ;
+
+  if(!flag_hx) {
+    const double f2iy = accessv( flag_hy, use_y_derivs, ix+1, iy, nm,
+				 ndy, ndcb, Inv.cb, Inv.y , Grid ) ;
+    if(use_x_derivs) {
+      const int offset = nm < dxQG0 ? dxQG0 : QL4 ;
+      // These enum additions are pretty sketchy...
+      const double g1iy = accessv( flag_hy, use_y_derivs, ix, iy, (FFidx)(nm+offset),
+				   ndy, ndcb, Inv.cb, Inv.y, Grid ) ;
+      const double g2iy = accessv( flag_hy, use_y_derivs, ix+1, iy, (FFidx)(nm+offset),
+				   ndy, ndcb, Inv.cb, Inv.y, Grid ) ;
+
+      return interpol4( Inv.INVx, f1iy, f2iy, g1iy, g2iy ) ;
+    } else {
+      // lerpity lerp
+      return lerp( Inv.INVx.lA , f1iy , f2iy ) ;
+    }
+  }
+  return f1iy ;
+}
+
+// extract the form factor
+__device__
+void
+extractff2( const FFidx nm,
+	    const NDCB ndcb,
+	    const struct invariants& Inv ,
+	    const struct Grid_coeffs& Grid ,
+	    double F[4] )
+{  
+  // derivative map
+  const NDCB ndcb2 = (NDCB)(ndcb+1 < 5 ? ndcb+1 : ndcb) ;
+  // map for the x-derivative, incomplete as some derivatives aren't used
+  const FFidx dxmap[14] = { dxQG0  , dxQG1 , dxQG2  , dxQG3  , dxQL4 , dxQL2 ,
+			  dxQG0  , dxQG1 , d2xQG2 , d2xQG3 , dxQL4 , dxQL2 ,
+			  d2xQG2 , d2xQG3 } ;
+  // derivative wrt dcb
+  F[0] = extractff( nm, false , ndcb2 , Inv , Grid ) ;
+  // derivative wrt x
+  F[1] = extractff( dxmap[nm], false , ndcb  , Inv , Grid ) ;
+  // derivative wrt y
+  F[2] = extractff( nm, true  , ndcb  , Inv , Grid ) ;
+  // no derivative
+  F[3] = extractff( nm, false , ndcb  , Inv , Grid ) ;
+  return ;
+}
+
+// Initialises the invariants used in chnr_*
+__device__ __noinline__
+static void // struct invariants
+set_invariants( const double xv[4] ,
+		const double yv[4] ,
+		const struct Grid_coeffs& Grid,
+                struct invariants& Inv )
+{
+  // struct invariants Inv ;
+  const double EPSIN = 1E-7 ;
+  
+  Inv.xsq = SCALPROD( xv , xv ) ;
+  Inv.xsq = Inv.xsq < EPSIN ? EPSIN : Inv.xsq ;
+  Inv.x = sqrt( fabs( Inv.xsq ) ) ;
+
+  // y needs a little fudge factor as it is badly behaved for very small y
+  Inv.ysq = SCALPROD( yv , yv ) ;
+  Inv.ysq = Inv.ysq < EPSIN ? EPSIN : Inv.ysq ;
+  Inv.y = sqrt( fabs( Inv.ysq ) ) ;
+
+  Inv.xdoty = SCALPROD( xv , yv ) ;
+  Inv.cb = Inv.xdoty/( Inv.x * Inv.y ) ;
+
+  Inv.cborig = Inv.cb ;
+  Inv.yorig = Inv.y ;
+  Inv.xmysq = ( Inv.xsq + Inv.ysq )*(1.00000000000001)-2.0*Inv.xdoty ;
+  Inv.xmy = sqrt( fabs( Inv.xmysq ) ) ;
+
+  Inv.flag2 = false ;
+  const double rx = ( Inv.x > Inv.xmy ? Inv.xmy/Inv.x : Inv.x/Inv.xmy);
+  const double rxy = ( Inv.x > Inv.y ? Inv.y/Inv.x : Inv.x/Inv.y);
+
+  if( rx < rxy
+      && Inv.xmy < __ldg(Grid.YY + Grid.nstpy-1)
+      && fabs(Inv.xmysq) > 1E-28 ) {
+    Inv.cb = (Inv.x-Inv.y*Inv.cb)/Inv.xmy ;
+    Inv.y = Inv.xmy ;    
+    Inv.flag2 = true ;
+  }
+
+  // setup INVx
+  const size_t ix1 = (size_t)find_ind( Grid.XX , Inv.x , 0 , Grid.nstpx ) ;
+  // const size_t ix1 = (size_t)find_bin( Grid.xstp , Inv.x , Grid.nstpx ) ;
+  size_t ix2 = ix1+1 ;
+  if( ix2 >= (size_t)Grid.nstpx ) {
+    ix2 = ix1 ;
+  }
+  precompute_INV( &Inv.INVx, Inv.x, __ldg(Grid.XX+ix1), __ldg(Grid.XX+ix2) , ix1 ) ;
+  
+  // setup InvY
+  const size_t iy1 = (size_t)find_ind( Grid.YY , Inv.y , 0 , Grid.nstpy ) ;  
+  // const size_t iy1 = (size_t)find_bin( Grid.ystp , Inv.y , Grid.nstpy ) ;
+  // y edge case
+  size_t iy2 = iy1 + 1 ;
+  if( iy2 >= (size_t)Grid.nstpy ) {
+    iy2 = iy1 ;
+  }
+  precompute_INV( &Inv.INVy , Inv.y , __ldg(Grid.YY+iy1) , __ldg(Grid.YY+iy2) , iy1 ) ;
+  
+  // return Inv ;
+}
+
+// __device__
+// static int
+// compute_dg_TAYLORX( double *dg0dy ,
+// 		    double *dg0dx ,
+// 		    double *dg0dcb ,
+// 		    const struct invariants& Inv ,
+// 		    const struct Grid_coeffs& Grid )
+// {  
+//   const int iy_tay = find_ind( getTX(&Grid,YY) , Inv.y , 0 , Grid.NY_tay ) ;
+//   const int iy = find_ind( Grid.YY , Inv.y , 0 , Grid.nstpy ) ;
+  
+//   if( iy_tay == Grid.NY_tay-1 || iy == Grid.nstpy-1 ) {
+//     return 1 ;
+//   }
+
+//   const int iy2_tay = iy_tay+1;
+//   const int ix  = 0;
+  
+//   const double ay = (__ldg(getTX(&Grid,YY)+iy2_tay)-Inv.y)
+//     /(getTX(&Grid,YY)[iy2_tay]-getTX(&Grid,YY)[iy_tay]);
+//   const double ax = ( __ldg(Grid.XX)-Inv.x)/( __ldg(Grid.XX));
+  
+//   double f1 = Inv.cb*lerp( ay , getTX(&Grid,G0dx)[iy_tay] , getTX(&Grid,G0dx)[iy2_tay] ) ;  
+//   double f2 = accessv( false, true, ix, iy, dxQG0, false, d0cb, Inv.cb, Inv.y, Grid );
+//   *dg0dx = lerp( ax , f1 , f2 ) ;
+
+//   f1 = lerp( ay , getTX(&Grid,G0dy)[iy_tay] , getTX(&Grid,G0dy)[iy2_tay ] ) ;
+//   f2 = accessv( false, false, ix, iy, QG0, true , d0cb, Inv.cb, Inv.y, Grid );
+//   *dg0dy = lerp( ax , f1 , f2 ) ;
+    
+//   f2 = accessv( false, true , ix, iy, QG0, false, d1cb, Inv.cb, Inv.y, Grid );
+//   *dg0dcb = lerp( ax , 0.0 , f2 ) ;
+
+//   return 0 ;
+// }
+
+// sets dyv[bet]= \partial^(y)_\beta < I >_epsilon
+// sets dxv[bet]= \partial^(x)_\beta < I >_epsilon
+__device__
+int
+chnr_dS( const double xv[4] ,
+	 const double yv[4] ,
+	 const struct invariants& Inv ,
+	 const struct Grid_coeffs& Grid ,
+	 double dxv[4] ,
+	 double dyv[4] )
+{
+  double dg0dy, dg0dx, dg0dcb;
+  
+  if( Inv.x < __ldg(Grid.XX) ) {
+    // FORNOW
+    // if( compute_dg_TAYLORX( &dg0dy , &dg0dx , &dg0dcb , Inv, Grid ) == 1 ) {
+    //   return 1 ;
+    // }
+  } else if( Inv.x > __ldg(Grid.XX + Grid.nstpx -1) ) {
+    return 1 ;
+  } else { 
+    double f[4];
+    extractff2( QG0 , d0cb, Inv, Grid , f );
+    dg0dcb = f[0] ;
+    dg0dx  = f[1] ;
+    dg0dy  = f[2] ;
+  }
+  
+  if( Inv.flag2 ) {
+    const double dgs0dx  = dg0dx;
+    const double dgs0dcb = dg0dcb;
+    const double dgs0dy  = dg0dy;
+    const double ca = Inv.cb; 
+    const double cd = (Inv.yorig-Inv.x*Inv.cborig)/Inv.xmy;
+    dg0dx  = dgs0dx + (1.0-ca*ca)/Inv.xmy*dgs0dcb + ca*dgs0dy;
+    dg0dcb = -(Inv.ysq*cd*dgs0dcb + Inv.x*Inv.yorig*Inv.xmy*dgs0dy)/Inv.xmysq; 
+    dg0dy  = -(Inv.cborig+ca*cd)/Inv.xmy*dgs0dcb+cd*dgs0dy;
+  } 
+
+  int bet ;
+  for(bet=0;bet<4;bet++) {
+    const double yhat = yv[bet]/Inv.yorig;
+    const double xhat = xv[bet]/Inv.x;
+    const double c2 = (xhat-Inv.cborig*yhat)/Inv.yorig;
+    const double c4 = (yhat-Inv.cborig*xhat)/Inv.x;
+    dyv[bet] = yhat*dg0dy+c2*dg0dcb;
+    dxv[bet] = xhat*dg0dx+c4*dg0dcb;
+  }
+  return 0 ;
+}
+
+// little storage for the temporary variables
+struct ttmps {
+  double ell1, ell2, ell3, v1, ell4, dv1dx, dv1dy, dv1dcb, dell2dx, dell2dy, dell2dcb;
+  double dell1dx, dell1dy, dell1dcb, dell3dx, dell3dy, dell3dcb, dell4dy, dell4dx, dell4dcb;
+} ;
+
+// __device__
+// static int
+// TAYLORX_contribution( struct ttmps *T ,
+// 		      const struct invariants& Inv ,
+// 		      const struct Grid_coeffs& Grid )
+// {
+//   // Just like non taylor-expanded version need to set this due to
+//   // it being set differently compared to the V and S
+//   const double ysq = Inv.flag2 ? Inv.xmysq : Inv.ysq ;
+  
+//   // set the indices
+//   const int iy_tay  = find_ind( getTX(&Grid,YY) , Inv.y , 0 , Grid.NY_tay ) ;      
+//   const int iy = find_ind( Grid.YY , Inv.y , 0 , Grid.nstpy ) ;
+
+//   // check they are reasonable
+//   if( iy_tay == Grid.NY_tay-1 || iy == Grid.nstpy-1 ) {
+//     // fprintf( stderr , "chnr_dT TAYLORX y is at or above edge of grid\n" ) ;
+//     // fprintf( stderr , "%f >= %f\n" , Inv.y , getTX(&Grid,YY)[iy_tay] ) ;
+//     // fprintf( stderr , "%f >= %f\n" , Inv.y , Grid.YY[Grid.nstpy-1] ) ;
+//     return 1 ;
+//   }
+
+//   const int iy2_tay = iy_tay+1;
+//   const int ix = 0 ;
+  
+//   const double ay = (__ldg(getTX(&Grid,YY)+iy2_tay)-Inv.y)/
+//       (__ldg(getTX(&Grid,YY)+iy2_tay)- __ldg(getTX(&Grid,YY)+iy_tay));
+//   const double ax = (__ldg(Grid.XX)-Inv.x)/(__ldg(Grid.XX));
+  
+//   const double xb=__ldg(Grid.XX);
+//   const double xbsq=xb*xb;
+  
+//   const double ell2a = lerp( ay , __ldg(getTX(&Grid,Gl2)+iy_tay) , __ldg(getTX(&Grid,Gl2)+iy2_tay) ) ;
+//   const double ell2b = accessv(false, true, ix, iy, QL2, false, d0cb, Inv.cb, Inv.y, Grid );
+//   T -> ell2 = lerp(ax, ell2a, ell2b) ;
+  
+//   const double dell2adx = lerp( ay , __ldg(getTX(&Grid,Gl21) + iy_tay) , __ldg(getTX(&Grid,Gl21) + iy2_tay) )*Inv.cb ;
+//   const double dell2bdx = accessv(false, true, ix, iy, dxQL2, false, d0cb, Inv.cb, Inv.y , Grid );
+//   T -> dell2dx = lerp(ax, dell2adx, dell2bdx) ;
+
+//   const double dell2ady = lerp( ay , __ldg(getTX(&Grid,Gl2dy) + iy_tay) , __ldg(getTX(&Grid,Gl2dy) + iy2_tay) ) ;
+//   const double dell2bdy = accessv(false, false, ix, iy, QL2 , true, d0cb, Inv.cb, Inv.y , Grid ) ;
+//   T -> dell2dy = lerp(ax, dell2ady, dell2bdy) ;
+
+//   const double dell2adcb = 0.0;
+//   const double dell2bdcb = accessv(false, true, ix, iy, QL2 , false, d1cb, Inv.cb, Inv.y , Grid );
+//   T -> dell2dcb = lerp(ax ,dell2adcb ,dell2bdcb ) ;
+  
+//   const double v1b       = accessv(false, true , ix, iy, QG1  , false, d0cb , Inv.cb, Inv.y , Grid );
+//   const double dv1bdx    = accessv(false, true , ix, iy, dxQG1, false, d0cb , Inv.cb, Inv.y , Grid );
+//   const double dv1bdy    = accessv(false, false, ix, iy, QG1  , true , d0cb , Inv.cb, Inv.y , Grid );
+//   const double dv1bdcb   = accessv(false, true , ix, iy, QG1  , false, d1cb , Inv.cb, Inv.y , Grid );
+//   const double ell4b     = accessv(false, true , ix, iy, QL4  , false, d0cb , Inv.cb, Inv.y , Grid );
+//   const double dell4bdx  = accessv(false, true , ix, iy, dxQL4, false, d0cb , Inv.cb, Inv.y , Grid );
+//   const double dell4bdy  = accessv(false, false, ix, iy, QL4  , true , d0cb , Inv.cb, Inv.y , Grid );
+//   const double dell4bdcb = accessv(false, true , ix, iy, QL4  , false, d1cb , Inv.cb, Inv.y , Grid );
+  
+//   const double ell3a = lerp( ay , __ldg(getTX(&Grid,Gl3) + iy_tay) , __ldg(getTX(&Grid,Gl3) + iy2_tay) ) ;
+//   const double ell3b = ell4b/(2.0*xbsq*ysq) - Inv.y*Inv.cb*ell2b/xb;
+//   T -> ell3 = lerp( ax , ell3a , ell3b ) ;
+
+//   const double ell1b = 4.0/(3.0*xbsq*xbsq)*(v1b - xbsq*ysq*(Inv.cb*Inv.cb-0.25)*ell2b - 1.5*xbsq*xb*Inv.y*Inv.cb*ell3b);
+//   T -> ell1 = ell1b;
+
+//   const double dell3ady = lerp( ay , __ldg(getTX(&Grid,Gl3dy) + iy_tay) , __ldg(getTX(&Grid,Gl3dy) + iy2_tay) ) ;
+//   const double dell3bdy = (-ell4b/(ysq*Inv.y)
+// 			   + dell4bdy/(2.0*ysq)
+// 			   - Inv.cb*xb*ell2b
+// 			   - Inv.y*xb*Inv.cb*dell2bdy)/(xbsq);
+//   T -> dell3dy = lerp( ax, dell3ady , dell3bdy ) ; 
+
+//   const double dell3adcb = 0.0;
+//   const double dell3bdcb = (dell4bdcb/(2.0*xb*ysq)
+// 			    -Inv.y*ell2b - Inv.y*Inv.cb*dell2bdcb)/xb;
+//   T -> dell3dcb = lerp( ax , dell3adcb , dell3bdcb ) ; 
+
+//   const double dell3bdx = (-ell4b/(xb*ysq)
+// 			   + dell4bdx/(2.0*ysq)
+// 			   + Inv.y*Inv.cb*ell2b
+// 			   - Inv.y*xb*Inv.cb*dell2bdx)/xbsq;
+//   T -> dell3dx = dell3bdx;
+
+//   T -> dell1dy = 4.0/(3.0*xbsq*xbsq)*(dv1bdy-2.0*xbsq*Inv.y*(Inv.cb*Inv.cb-0.25)*ell2b
+// 				      -xbsq*ysq*(Inv.cb*Inv.cb-0.25)*dell2bdy
+// 				      -1.5*xbsq*xb*Inv.cb*ell3b
+// 				      -1.5*xbsq*xb*Inv.y*Inv.cb*dell3bdy) ;
+  
+//   T -> dell1dcb = 4.0/(3.0*xbsq*xbsq)
+//     *(dv1bdcb - 2.0*xbsq*ysq*Inv.cb*ell2b-xbsq*ysq*(Inv.cb*Inv.cb-0.25)*dell2bdcb
+//       -1.5*xbsq*xb*Inv.y*ell3b-1.5*xbsq*xb*Inv.y*Inv.cb*dell3bdcb);
+
+//   T -> dell1dx = -4.0*ell1b/xb + 4.0/(3.0*xbsq*xbsq)
+//     *(dv1bdx - 2.0*xb*ysq*(Inv.cb*Inv.cb-0.25)*ell2b-xbsq*ysq*(Inv.cb*Inv.cb-0.25)*dell2bdx
+//       -4.5*xbsq*Inv.y*Inv.cb*ell3b - 1.5*xbsq*xb*Inv.y*Inv.cb*dell3bdx);
+
+//   return 0 ;
+// }
+
+// __device__
+// static void
+// XMYSWAP_T_contrib( struct ttmps *T ,
+// 		   const struct invariants& Inv )
+// {
+//   const double ell2s = T -> ell2;
+//   const double dells2dx  = T -> dell2dx;
+//   const double dells2dcb = T -> dell2dcb;
+//   const double dells2dy  = T -> dell2dy;
+//   const double cd = ( Inv.yorig-Inv.x*Inv.cborig)/Inv.xmy;
+//   T->ell2     = ell2s;
+//   T->dell2dx  = dells2dx + (1.0-Inv.cb*Inv.cb)/Inv.xmy*dells2dcb + Inv.cb*dells2dy;
+//   T->dell2dcb = -(Inv.ysq*cd*dells2dcb + Inv.x*Inv.yorig*Inv.xmy*dells2dy)/Inv.xmysq;
+//   T->dell2dy  = -(Inv.cborig+Inv.cb*cd)/Inv.xmy*dells2dcb+cd*dells2dy;
+  
+//   const double ell3s     = -T->ell3;
+//   const double dells3dx  = -T->dell3dx;
+//   const double dells3dcb = -T->dell3dcb;
+//   const double dells3dy  = -T->dell3dy;
+
+//   T->ell3    =  ell3s - T->ell2; 
+//   T->dell3dx =  dells3dx + (1.0-Inv.cb*Inv.cb)/Inv.xmy*dells3dcb + Inv.cb*dells3dy - T->dell2dx;
+//   T->dell3dcb =  -(Inv.ysq*cd*dells3dcb + Inv.x*Inv.yorig*Inv.xmy*dells3dy)/Inv.xmysq - T->dell2dcb;
+//   T->dell3dy  =  -(Inv.cborig+Inv.cb*cd)/Inv.xmy*dells3dcb+cd*dells3dy - T->dell2dy;
+  
+//   const double ell1s = T->ell1;
+//   const double dells1dx  = T->dell1dx;
+//   const double dells1dcb = T->dell1dcb;
+//   const double dells1dy  = T->dell1dy;
+//   T->ell1     = ell1s - T->ell2 -2.0*T->ell3;
+//   T->dell1dx  = dells1dx + (1.0-Inv.cb*Inv.cb)/Inv.xmy*dells1dcb
+//     + Inv.cb*dells1dy - T->dell2dx - 2.0*T->dell3dx;
+//   T->dell1dcb = -(Inv.ysq*cd*dells1dcb + Inv.x*Inv.yorig*Inv.xmy*dells1dy)/Inv.xmysq
+//     - T->dell2dcb -2.0*T->dell3dcb;
+//   T->dell1dy  = -(Inv.cborig+Inv.cb*cd)/Inv.xmy*dells1dcb+cd*dells1dy
+//     - T->dell2dy -2.0*T->dell3dy;
+// }
+
+// set dyv[alf][bet][dta]= \partial^(y)_\beta <(epsilon_alf epsilon_dta - 1/4 delta_{alf dta}) I>_epsilon
+// and dxv[alf][bet][dta]= \partial^(x)_\beta <(epsilon_alf epsilon_dta - 1/4 delta_{alf dta}) I>_epsilon
+__device__
+int
+chnr_dT( const double xv[4] ,
+	 const double yv[4] ,
+	 const struct invariants& Inv ,
+	 const struct Grid_coeffs& Grid ,
+	 double dxv[4][4][4] ,
+	 double dyv[4][4][4] )
+{
+  struct ttmps T ;
+  const double ysq = Inv.flag2 ? Inv.xmysq : Inv.ysq ;
+  
+  if( Inv.x < __ldg(Grid.XX)) {
+    // FORNOW
+    // if( TAYLORX_contribution( &T , Inv , Grid ) == 1 ) {
+    //   return 1 ;
+    // }
+  } else if( Inv.x > __ldg(Grid.XX + Grid.nstpx -1) ) {
+    return 1 ;
+  } else {
+    double f[4] KQED_ALIGN ;
+    extractff2( QL2 , d0cb , Inv , Grid , f ) ;
+    T.dell2dx  = f[1] ;
+    T.dell2dy  = f[2] ;
+    T.ell2     = f[3] ;
+    T.dell2dcb = f[0] ;
+
+    extractff2( QL4 , d0cb , Inv , Grid , f ) ;
+    T.dell4dx  = f[1] ;
+    T.dell4dy  = f[2] ;
+    T.ell4     = f[3] ;
+    T.dell4dcb = f[0] ; 
+    
+    extractff2( QG1 , d0cb , Inv , Grid , f ) ;
+    T.dv1dx  = f[1] ;
+    T.dv1dy  = f[2] ;
+    T.v1     = f[3] ;
+    T.dv1dcb = f[0] ;
+    
+    T.ell3 = T.ell4/(2.0*Inv.xsq*ysq) - Inv.y*Inv.cb*T.ell2/Inv.x;
+    T.ell1 = 4.0/(3.0*Inv.xsq*Inv.xsq)*
+      (T.v1 - Inv.xsq*ysq*(Inv.cb*Inv.cb-0.25)*T.ell2
+       - 1.5*Inv.xsq*Inv.x*Inv.y*Inv.cb*T.ell3);
+        
+    T.dell3dy  = (-T.ell4/(ysq*Inv.y) + T.dell4dy/(2.0*ysq)
+		  - Inv.cb*Inv.x*T.ell2 -
+		  Inv.y*Inv.x*Inv.cb*T.dell2dy)/(Inv.xsq);
+    
+    T.dell3dcb = (T.dell4dcb/(2.0*Inv.x*ysq) -
+		  Inv.y*T.ell2 - Inv.y*Inv.cb*T.dell2dcb)/Inv.x;
+    
+    T.dell3dx  = (-T.ell4/(Inv.x*ysq)
+		  + T.dell4dx/(2.0*ysq)
+		  + Inv.y*Inv.cb*T.ell2
+		  - Inv.y*Inv.x*Inv.cb*T.dell2dx)/Inv.xsq;
+    
+    T.dell1dy  = 4.0/(3.0*Inv.xsq*Inv.xsq)*(T.dv1dy-2.0*Inv.xsq*Inv.y*(Inv.cb*Inv.cb-0.25)*T.ell2
+				    -Inv.xsq*ysq*(Inv.cb*Inv.cb-0.25)*T.dell2dy
+				    -1.5*Inv.xsq*Inv.x*Inv.cb*T.ell3-1.5*Inv.xsq*Inv.x*Inv.y*Inv.cb*T.dell3dy);
+    
+    T.dell1dcb = 4.0/(3.0*Inv.xsq*Inv.xsq)*(T.dv1dcb
+				    - 2.0*Inv.xsq*ysq*Inv.cb*T.ell2-Inv.xsq*ysq*(Inv.cb*Inv.cb-0.25)*T.dell2dcb
+				    -1.5*Inv.xsq*Inv.x*Inv.y*T.ell3-1.5*Inv.xsq*Inv.x*Inv.y*Inv.cb*T.dell3dcb);
+    
+    T.dell1dx  = -4.0*T.ell1/Inv.x
+      + 4.0/(3.0*Inv.xsq*Inv.xsq)*(T.dv1dx- 2.0*Inv.x*ysq*(Inv.cb*Inv.cb-0.25)*T.ell2
+			   -Inv.xsq*ysq*(Inv.cb*Inv.cb-0.25)*T.dell2dx
+			   -4.5*Inv.xsq*Inv.y*Inv.cb*T.ell3
+				   - 1.5*Inv.xsq*Inv.x*Inv.y*Inv.cb*T.dell3dx);
+  }
+
+  if( Inv.flag2 ) {
+    // FORNOW
+    // XMYSWAP_T_contrib( &T , Inv ) ;
+  } 
+   
+  int alf, bet, dta ;
+  for(bet=0;bet<4;bet++)  {  
+    const double c1 = yv[bet]/Inv.yorig;
+    const double c3 = xv[bet]/Inv.x;
+    const double c2 = (c3-Inv.cborig*c1)/Inv.yorig;
+    const double c4 = (c1-Inv.cborig*c3)/Inv.x;
+    for(alf=0;alf<4;alf++)  {
+      const int d_ab = ( alf==bet ) ;
+      for(dta=0;dta<4;dta++) {
+	const int d_bd = ( bet==dta ) ;
+	const int d_ad = ( alf==dta ) ;
+	const double t1 = d_ab*yv[dta]+d_bd*yv[alf]-0.5*d_ad*yv[bet];
+	const double t2 = d_ab*xv[dta]+d_bd*xv[alf]-0.5*d_ad*xv[bet];
+	const double t3 = xv[alf]*xv[dta]-d_ad*Inv.xsq/4;
+	const double t4 = yv[alf]*yv[dta]-d_ad*Inv.ysq/4;
+	const double t5 = xv[alf]*yv[dta]+yv[alf]*xv[dta]-0.5*Inv.xdoty*d_ad;
+	dyv[alf][bet][dta] =
+	  + t1*T.ell2
+	  + t2*T.ell3
+	  + t3*(c1*T.dell1dy + c2*T.dell1dcb)
+	  + t4*(c1*T.dell2dy + c2*T.dell2dcb)
+	  + t5*(c1*T.dell3dy + c2*T.dell3dcb)
+	  ;
+	dxv[alf][bet][dta] =
+	  + t2*T.ell1
+	  + t1*T.ell3
+	  + t3*(c3*T.dell1dx + c4*T.dell1dcb)
+	  + t4*(c3*T.dell2dx + c4*T.dell2dcb)
+	  + t5*(c3*T.dell3dx + c4*T.dell3dcb)
+	  ;
+      }
+    }
+  }
+  
+  return 0 ;
+}
+
+// little struct definition to store all these variables
+struct vtmp {
+  double g2, dg1dx, dg1dy, dg1dcb, dg2dx, dg2dy, dg2dcb , dg3dx, dg3dy, dg3dcb;
+  double ddg2dxdx, ddg2dxdy, ddg2dxdcb, ddg2dydcb, ddg2dcbdcb;
+  double ddg3dxdx, ddg3dxdy, ddg3dxdcb, ddg3dydcb, ddg3dcbdcb;
+  double ddg1dxdx, ddg1dxdy, ddg1dxdcb, ddg1dydcb, ddg1dcbdcb;
+  double ddg1dydy , ddg2dydy ;
+} ;
+
+// __device__
+// static int
+// taylorx_contrib( const struct Grid_coeffs Grid ,
+// 		 struct vtmp *D ,
+// 		 const double x ,
+// 		 const double y ,
+// 		 const double xsq ,
+// 		 const bool flag2 ,
+// 		 double cb )
+// { 
+//   const int iy_tay  = find_ind( getTX(&Grid, YY) , y , 0 , Grid.NY_tay ) ;
+//   const int iy = find_ind( Grid.YY , y , 0 , Grid.nstpy ) ;
+  
+//   if( iy_tay == Grid.NY_tay-1 || iy == Grid.nstpy-1 ) {
+//     return 1 ;
+//   }
+
+//   const int iy2_tay = iy_tay+1;
+//   const int ix=0;
+  
+//   const double ay = (__ldg(getTX(&Grid,YY)+iy2_tay)-y)/(__ldg(getTX(&Grid,YY)+iy2_tay)-__ldg(getTX(&Grid,YY)+iy_tay));
+//   const double ax = (__ldg(Grid.XX)-x)/(__ldg(Grid.XX));
+
+//   const double xb=__ldg(Grid.XX) ;
+//   const double xbsq=xb*xb;
+
+//   const double g2a = 0.0;
+//   const double g2b = accessv( false, true, ix, iy, QG2 , false, d0cb, cb, y, Grid );
+//   D -> g2 = lerp( ax , g2a , g2b ) ;
+
+//   const double ddg2adxdcb = lerp( ay , getTX(&Grid,G21)[iy_tay] , getTX(&Grid,G21)[iy2_tay] ) ;
+//   const double ddg2bdxdcb = accessv( false, true, ix, iy, dxQG2, false, d1cb, cb, y, Grid );
+//   D -> ddg2dxdcb = lerp( ax , ddg2adxdcb , ddg2bdxdcb ) ;
+
+//   const double dg2bdx = accessv( false, true, ix, iy, dxQG2, false, d0cb, cb, y , Grid );
+//   D -> dg2dx = D -> ddg2dxdcb*cb; // ax*dg2adx + (1.0-ax)*dg2bdx;
+
+//   const double dg2bdcb = accessv( false, true , ix, iy, QG2, false, d1cb, cb, y , Grid );
+//   D -> dg2dcb = D -> ddg2dxdcb*x; // dg2dx*x/cb; // ax*dg2adcb + (1.0-ax)*dg2bdcb;
+
+//   const double dg2bdy = accessv( false, false, ix, iy, QG2, true, d0cb, cb, y , Grid );
+//   D -> dg2dy = lerp( ax , 0.0 , dg2bdy ) ;
+
+//   const double ddg2adxdy = cb*lerp( ay , getTX(&Grid,G21dy)[iy_tay] , getTX(&Grid,G21dy)[iy2_tay] ) ;
+//   const double ddg2bdxdy = accessv( false, false, ix, iy, dxQG2, true, d0cb, cb, y , Grid );
+//   D -> ddg2dxdy = lerp( ax , ddg2adxdy , ddg2bdxdy ) ;
+
+//   const double ddg2adxdx = 2.0*( lerp( ay , getTX(&Grid,G22A)[iy_tay] , getTX(&Grid,G22A)[iy2_tay] ) 
+// 				 + lerp( ay , getTX(&Grid,G22B)[iy_tay] , getTX(&Grid,G22B)[iy2_tay] )
+// 				 *(0.4+0.6*(2.0*cb*cb-1)));
+//   const double ddg2bdxdx = accessv( false, true , ix, iy, d2xQG2, false, d0cb, cb, y , Grid );
+//   D -> ddg2dxdx = lerp( ax , ddg2adxdx , ddg2bdxdx ) ;
+
+
+//   const double ddg2bdcbdcb = accessv(false, true, ix, iy, QG2, false, d2cb, cb, y , Grid );
+//   D -> ddg2dcbdcb = ddg2bdcbdcb*xsq/xbsq; // the function starts quadratically
+
+//   const double ddg2bdydcb = accessv( false, false, ix, iy, QG2, true, d1cb, cb, y, Grid );
+//   D -> ddg2dydcb = lerp( ax , 0.0 , ddg2bdydcb ) ;
+  
+//   const double dg3bdy      = accessv( false, false, ix, iy, QG3   , true , d0cb, cb, y , Grid );
+//   const double ddg3bdxdy   = accessv( false, false, ix, iy, dxQG3 , true , d0cb, cb, y , Grid );
+//   const double ddg3bdxdcb  = accessv( false, true , ix, iy, dxQG3 , false, d1cb, cb, y , Grid );
+//   const double ddg3bdxdx   = accessv( false, true , ix, iy, d2xQG3, false, d0cb, cb, y , Grid );
+//   const double ddg3bdcbdcb = accessv( false, true , ix, iy, QG3   , false, d2cb, cb, y , Grid );
+//   const double ddg3bdydcb  = accessv( false, false, ix, iy, QG3   , true , d1cb, cb, y , Grid );
+
+//   const double dg1bdy = dg3bdy - cb/xb*g2b -(y/xb)*cb*dg2bdy;
+//   const double ddg1bdxdx =  ddg3bdxdx -2.0*y/(xbsq*xb)*cb*g2b+y/xbsq*cb*dg2bdx + y/xbsq*cb*dg2bdx - y/xb*cb*ddg2bdxdx;
+//   const double ddg1bdxdy = ddg3bdxdy +cb/xbsq*g2b + y*cb/xbsq*dg2bdy -cb/xb*dg2bdx - y/xb*cb*ddg2bdxdy;
+//   const double ddg1bdxdcb = ddg3bdxdcb +y/xbsq*g2b +y/xbsq*cb*dg2bdcb -y/xb*dg2bdx -y/xb*cb*ddg2bdxdcb;
+//   const double ddg1bdydcb = ddg3bdydcb - g2b/xb -cb/xb*dg2bdcb -y/xb*dg2bdy - y/xb*cb*ddg2bdydcb;
+//   const double ddg1bdcbdcb = ddg3bdcbdcb - 2.0*y/xb*dg2bdcb - y/xb*cb*ddg2bdcbdcb;
+    
+//   const double dg1ady = lerp( ay , getTX(&Grid,G3Ady)[iy_tay] , getTX(&Grid,G3Ady)[iy2_tay] )
+//     - lerp( ay , getTX(&Grid,G3Bdy)[iy_tay] , getTX(&Grid,G3Bdy)[iy2_tay] ) ;
+  
+//   const double ddg1adxdy = cb*( lerp( ay , getTX(&Grid,G31Ady)[iy_tay] , getTX(&Grid,G31Ady)[iy2_tay] )
+// 				-(2/3.)*lerp( ay , getTX(&Grid,G31Bdy)[iy_tay] , getTX(&Grid,G31Bdy)[iy2_tay] )
+// 				-lerp( ay , getTX(&Grid,G22A)[iy_tay] , getTX(&Grid,G22A)[iy2_tay] )
+// 				-y*lerp( ay , getTX(&Grid,G22Ady)[iy_tay] , getTX(&Grid,G22Ady)[iy2_tay] )) ;
+//   const double ddg1adxdcb =
+//     lerp( ay , getTX(&Grid,G31A)[iy_tay] , getTX(&Grid,G31A)[iy2_tay] )
+//     -(2/3.)*lerp( ay , getTX(&Grid,G31B)[iy_tay] , getTX(&Grid,G31B)[iy2_tay] )
+//     -y*lerp( ay , getTX(&Grid,G22A)[iy_tay] , getTX(&Grid,G22A)[iy2_tay] ) ;
+
+//   const double ddg1adxdx = ddg1bdxdx; 
+//   D -> ddg1dxdcb  = lerp( ax , ddg1adxdcb , ddg1bdxdcb ) ;
+//   D -> dg1dx      = D -> ddg1dxdcb*cb; // ax*dg1adx + (1.0-ax)*dg1bdx;     
+//   D -> dg1dcb     = D -> ddg1dxdcb*x; // ax*dg1adcb + (1.0-ax)*dg1bdcb;     
+//   D -> dg1dy      = lerp( ax , dg1ady , dg1bdy ) ;
+//   D -> ddg1dxdy   = lerp( ax , ddg1adxdy , ddg1bdxdy ) ;
+//   D -> ddg1dxdx   = lerp( ax , ddg1adxdx , ddg1bdxdx ) ;
+//   D -> ddg1dcbdcb = ddg1bdcbdcb*xsq/xbsq; // the function starts quadratically 
+//   D -> ddg1dydcb  = lerp( ax , 0.0 , ddg1bdydcb ) ;
+
+//   if(flag2) {
+//     // in the case of a swap, you need the second derivative wrt y
+//     const double ya = __ldg(Grid.YY+iy);
+//     const double yb = __ldg(Grid.YY+iy+1) ; //ya+Grid.ystp;
+//     const double ddg2adydy= 0.0;
+
+//     const double dg2bdy_ya = accessv( false, false, ix, iy, QG2, true, d0cb, cb, ya, Grid );
+//     const double dg2bdy_yb = accessv( false, false, ix, iy, QG2, true, d0cb, cb, yb, Grid );
+//     const double ddg2bdydy = (dg2bdy_yb-dg2bdy_ya)/Grid.ystp;
+//     D -> ddg2dydy = ax*ddg2adydy + (1.0-ax)*ddg2bdydy;
+       
+//     const double ddg1adydy =
+//         (__ldg(getTX(&Grid,G3Ady)+iy2_tay)- __ldg(getTX(&Grid,G3Bdy)+iy2_tay)-
+//          ( __ldg(getTX(&Grid,G3Ady)+iy_tay)- __ldg(getTX(&Grid,G3Bdy)+iy_tay)))
+//         /(__ldg(getTX(&Grid,YY)+iy2_tay) - __ldg(getTX(&Grid,YY)+iy_tay) ) ;
+
+//     const double dg3bdy_ya = accessv( false, false, ix, iy, QG3, true, d0cb, cb, ya, Grid );
+//     const double dg3bdy_yb = accessv( false, false, ix, iy, QG3, true, d0cb, cb, yb, Grid );
+
+//     const double ddg3bdydy = (dg3bdy_yb-dg3bdy_ya)/Grid.ystp;
+//     const double ddg1bdydy = ddg3bdydy -(y*ddg2bdydy+2.0*dg2bdy)*cb/x;
+//     D -> ddg1dydy = ax*ddg1adydy + (1.0-ax)*ddg1bdydy;
+//   }
+
+//   return 0 ; 
+// }
+
+// // flips the sign of all the dg2 values
+// __device__
+// static struct vtmp
+// v_flip2( const struct vtmp D )
+// {
+//   struct vtmp F = D ; // memcpy
+//   F.g2         = -D.g2 ;
+//   F.dg2dx      = -D.dg2dx ;
+//   F.dg2dy      = -D.dg2dy ;
+//   F.dg2dcb     = -D.dg2dcb ;
+//   F.ddg2dxdx   = -D.ddg2dxdx ;
+//   F.ddg2dxdy   = -D.ddg2dxdy ;
+//   F.ddg2dydy   = -D.ddg2dydy ;
+//   F.ddg2dxdcb  = -D.ddg2dxdcb ;
+//   F.ddg2dydcb  = -D.ddg2dydcb ;
+//   F.ddg2dcbdcb = -D.ddg2dcbdcb ;  
+//   return F ;
+// }
+
+// __device__
+// static void
+// XMYSWAP_V_contrib2( struct vtmp *D ,
+// 		   const double x ,
+// 		   const double xmy ,
+// 		   const double y ,
+// 		   const double xsq ,
+// 		   const double xmysq ,
+// 		   const double ysq ,
+// 		   const double ca ,
+// 		   const double cborig )
+// { 
+//   const struct vtmp F = v_flip2( *D ) ; 
+//   const double cd = (y-x*cborig)/xmy;
+  
+//   D -> g2     = F.g2;
+//   D -> dg2dx  = F.dg2dx + (1.0-ca*ca)/xmy*F.dg2dcb + ca * F.dg2dy;
+//   D -> dg2dcb = -(ysq*cd*F.dg2dcb + x*y*xmy*F.dg2dy)/xmysq;
+//   D -> dg2dy  = -(cborig+ca*cd)/xmy*F.dg2dcb+cd*F.dg2dy;
+
+//   D -> dg1dx  = F.dg1dx + (1.0-ca*ca)/xmy*F.dg1dcb + ca * F.dg1dy - D -> dg2dx;
+//   D -> dg1dcb = -(ysq*cd*F.dg1dcb + x*y*xmy*F.dg1dy)/xmysq - D -> dg2dcb;
+//   D -> dg1dy  = -(cborig+ca*cd)/xmy*F.dg1dcb+cd*F.dg1dy - D -> dg2dy;
+
+//   // ddg2*
+//   D -> ddg2dxdx = (F.ddg2dxdx + (1.0-ca*ca)/xmy*F.ddg2dxdcb + ca * F.ddg2dxdy)
+//     - 3.0*ca*(1.0-ca*ca)/xmysq*F.dg2dcb
+//     + (1.0-ca*ca)/xmy*(F.ddg2dxdcb + (1.0-ca*ca)/xmy*F.ddg2dcbdcb + ca * F.ddg2dydcb)
+//     + (1.0-ca*ca)/xmy*F.dg2dy + ca*(F.ddg2dxdy + (1.0-ca*ca)/xmy*F.ddg2dydcb + ca * F.ddg2dydy);
+     
+//   D -> ddg2dxdcb = ysq/(xmysq*xmy)*(cborig+3.0*ca*cd)*F.dg2dcb
+//     -ysq/xmysq*cd*(F.ddg2dxdcb + (1.0-ca*ca)/xmy*F.ddg2dcbdcb + ca * F.ddg2dydcb)
+//     + y/xmysq*(x*ca-xmy)*F.dg2dy-x*y/xmy*(F.ddg2dxdy + (1.0-ca*ca)/xmy*F.ddg2dydcb
+// 					  + ca * F.ddg2dydy);
+  
+//   D -> ddg2dxdy = (-(cborig+ca*cd)/xmy*F.ddg2dxdcb+cd*F.ddg2dxdy)
+//     +(2.0*ca*cborig+cd*(3.0*ca*ca-1.0))/xmysq*F.dg2dcb
+//     +(1.0 - ca*ca)/xmy*(-(cborig + ca*cd)/xmy*F.ddg2dcbdcb + cd*F.ddg2dydcb)
+//     -(cborig+ca*cd)/xmy*F.dg2dy + ca*(-(cborig+ca*cd)/xmy*F.ddg2dydcb+cd*F.ddg2dydy);
+
+//   D -> ddg2dydcb = y/(xmysq*xmy)*((3.0*cd*cd-1.0)*y-2*xmy*cd)*F.dg2dcb
+//     -ysq/(xmysq)*cd*(-(cborig+ca*cd)/xmy*F.ddg2dcbdcb+cd*F.ddg2dydcb)
+//     + x/xmysq*(y*cd-xmy)*F.dg2dy
+//     -x*y/xmy*(-(cborig+ca*cd)/xmy*F.ddg2dydcb+cd*F.ddg2dydy);
+
+//   D -> ddg2dcbdcb = x*ysq/(xmysq*xmysq)*(xmy-3.0*y*cd)*F.dg2dcb
+//     - ysq/(xmysq)*cd*(-(ysq*cd*F.ddg2dcbdcb + x*y*xmy*F.ddg2dydcb)/xmysq)
+//     - xsq*ysq/(xmysq*xmy)*F.dg2dy
+//     - x*y/xmy*(-(ysq*cd*F.ddg2dydcb + x*y*xmy*F.ddg2dydy)/xmysq);
+
+//   // these have the 1s in
+//   D -> ddg1dxdx = ( F.ddg1dxdx + (1.0-ca*ca)/xmy*F.ddg1dxdcb + ca * F.ddg1dxdy)
+//     - 3.0*ca*(1.0-ca*ca)/xmysq*F.dg1dcb
+//     + (1.0-ca*ca)/xmy*(F.ddg1dxdcb + (1.0-ca*ca)/xmy*F.ddg1dcbdcb + ca * F.ddg1dydcb)
+//     + (1.0-ca*ca)/xmy*F.dg1dy + ca*(F.ddg1dxdy + (1.0-ca*ca)/xmy*F.ddg1dydcb + ca * F.ddg1dydy)
+//     - D -> ddg2dxdx;
+  
+//   D -> ddg1dxdcb = ysq/(xmysq*xmy)*(cborig+3.0*ca*cd)*F.dg1dcb
+//     - ysq/xmysq*cd*(F.ddg1dxdcb + (1.0-ca*ca)/xmy*F.ddg1dcbdcb + ca * F.ddg1dydcb)
+//     + y/xmysq*(x*ca-xmy)*F.dg1dy
+//     - x*y/xmy*(F.ddg1dxdy+ (1.0-ca*ca)/xmy*F.ddg1dydcb + ca * F.ddg1dydy)
+//     - D -> ddg2dxdcb;
+
+//   D -> ddg1dxdy = (-(cborig+ca*cd)/xmy*F.ddg1dxdcb+cd*F.ddg1dxdy)
+//     +(2.0*ca*cborig+cd*(3.0*ca*ca-1.0))/xmysq*F.dg1dcb
+//     +(1.0 - ca*ca)/xmy*(-(cborig + ca*cd)/xmy*F.ddg1dcbdcb + cd*F.ddg1dydcb)
+//     -(cborig+ca*cd)/xmy*F.dg1dy + ca*(-(cborig+ca*cd)/xmy*F.ddg1dydcb+cd*F.ddg1dydy)
+//     - D -> ddg2dxdy;
+
+//   D -> ddg1dydcb = y/(xmysq*xmy)*((3.0*cd*cd-1.0)*y-2*xmy*cd)*F.dg1dcb
+//     -ysq/(xmysq)*cd*(-(cborig+ca*cd)/xmy*F.ddg1dcbdcb+cd*F.ddg1dydcb)
+//     + x/xmysq*(y*cd-xmy)*F.dg1dy-x*y/xmy*(-(cborig+ca*cd)/xmy*F.ddg1dydcb+cd*F.ddg1dydy)
+//     - D -> ddg2dydcb;
+
+//   D -> ddg1dcbdcb = x*ysq/(xmysq*xmysq)*(xmy-3.0*y*cd)*F.dg1dcb
+//     - ysq/(xmysq)*cd*(-(ysq*cd*F.ddg1dcbdcb + x*y*xmy*F.ddg1dydcb)/xmysq)
+//     - xsq*ysq/(xmysq*xmy)*F.dg1dy
+//     - x*y/xmy*(-(ysq*cd*F.ddg1dydcb + x*y*xmy*F.ddg1dydy)/xmysq)
+//     - D -> ddg2dcbdcb;
+  
+//   return ;
+// }
+
+// using the computed values in D sets the array dv
+__device__
+static void
+get_dv( const double x ,
+	const double xv[4] ,
+	const double y ,
+	const double yv[4] ,
+	const double cb ,
+	struct vtmp D ,
+	double dv[4][4][4] )
+{
+  // look up tables and general precomputations
+  const double xhat[4] = { xv[0]/x , xv[1]/x , xv[2]/x , xv[3]/x } ;
+  const double yhat[4] = { yv[0]/y , yv[1]/y , yv[2]/y , yv[3]/y } ;
+  const double c2v[4] = { (xhat[0]-cb*yhat[0])/y , (xhat[1]-cb*yhat[1])/y ,
+			  (xhat[2]-cb*yhat[2])/y , (xhat[3]-cb*yhat[3])/y } ;
+  const double c4v[4] = { (yhat[0]-cb*xhat[0])/x , (yhat[1]-cb*xhat[1])/x ,
+			  (yhat[2]-cb*xhat[2])/x , (yhat[3]-cb*xhat[3])/x } ;
+  const double D1[4] = { xv[0]*D.ddg1dxdx+yv[0]*D.ddg2dxdx ,
+			 xv[1]*D.ddg1dxdx+yv[1]*D.ddg2dxdx ,
+			 xv[2]*D.ddg1dxdx+yv[2]*D.ddg2dxdx ,
+			 xv[3]*D.ddg1dxdx+yv[3]*D.ddg2dxdx } ;
+  const double D2[4] = { xv[0]*D.ddg1dxdy+yv[0]*D.ddg2dxdy ,
+			 xv[1]*D.ddg1dxdy+yv[1]*D.ddg2dxdy ,
+			 xv[2]*D.ddg1dxdy+yv[2]*D.ddg2dxdy ,
+			 xv[3]*D.ddg1dxdy+yv[3]*D.ddg2dxdy } ;
+  const double D3[4] = { xv[0]*D.ddg1dxdcb+yv[0]*D.ddg2dxdcb ,
+			 xv[1]*D.ddg1dxdcb+yv[1]*D.ddg2dxdcb ,
+			 xv[2]*D.ddg1dxdcb+yv[2]*D.ddg2dxdcb ,
+			 xv[3]*D.ddg1dxdcb+yv[3]*D.ddg2dxdcb } ;
+  const double D4[4] = { xv[0]*D.ddg1dydcb+yv[0]*D.ddg2dydcb ,
+			 xv[1]*D.ddg1dydcb+yv[1]*D.ddg2dydcb ,
+			 xv[2]*D.ddg1dydcb+yv[2]*D.ddg2dydcb ,
+			 xv[3]*D.ddg1dydcb+yv[3]*D.ddg2dydcb } ;
+  const double D5[4] = { xv[0]*D.ddg1dxdcb+yv[0]*D.ddg2dxdcb ,
+			 xv[1]*D.ddg1dxdcb+yv[1]*D.ddg2dxdcb ,
+			 xv[2]*D.ddg1dxdcb+yv[2]*D.ddg2dxdcb ,
+			 xv[3]*D.ddg1dxdcb+yv[3]*D.ddg2dxdcb } ;
+  const double D6[4] = { xv[0]*D.ddg1dcbdcb+yv[0]*D.ddg2dcbdcb ,
+			 xv[1]*D.ddg1dcbdcb+yv[1]*D.ddg2dcbdcb ,
+			 xv[2]*D.ddg1dcbdcb+yv[2]*D.ddg2dcbdcb ,
+			 xv[3]*D.ddg1dcbdcb+yv[3]*D.ddg2dcbdcb } ;
+  const double D7[4] = { (xv[0]*D.dg1dx+yv[0]*D.dg2dx)/x ,
+			 (xv[1]*D.dg1dx+yv[1]*D.dg2dx)/x ,
+			 (xv[2]*D.dg1dx+yv[2]*D.dg2dx)/x ,
+			 (xv[3]*D.dg1dx+yv[3]*D.dg2dx)/x } ;
+  const double D8[4] = { (xv[0]*D.dg1dcb+yv[0]*D.dg2dcb)/x ,
+			 (xv[1]*D.dg1dcb+yv[1]*D.dg2dcb)/x ,
+			 (xv[2]*D.dg1dcb+yv[2]*D.dg2dcb)/x ,
+			 (xv[3]*D.dg1dcb+yv[3]*D.dg2dcb)/x } ;
+
+  int bet , alf , dta ;
+  for(alf=0;alf<4;alf++)  {
+    const double astuff = (D.dg1dx+D.dg2dx)*xhat[alf]+(D.dg1dcb+D.dg2dcb)*c4v[alf] ;
+    for(bet=0;bet<4;bet++)  {
+      // this only depends on beta
+      const double bstuff = (D.dg1dx*xhat[bet]+D.dg1dy*yhat[bet]
+			     +D.dg1dcb*(xhat[bet]/y+yhat[bet]/x
+					-cb*(xhat[bet]/x+yhat[bet]/y))) ;
+      const double c2c4 = c2v[bet]+c4v[bet] ;
+      const int d_ab = ( alf==bet ) ;
+      const double xaxb = xhat[alf]*xhat[bet] ;
+      const double yayb = yhat[alf]*yhat[bet] ;
+      const double xayb = xhat[alf]*yhat[bet] ;
+      const double yaxb = yhat[alf]*xhat[bet] ;
+      const double c1 = ((cb*(3.0*xaxb-d_ab)-xayb-yaxb)/x+(d_ab+xayb*cb-xaxb-yayb)/y) ;
+      
+      for(dta=0;dta<4;dta++) {
+	const int d_bd = (bet==dta) ;
+	const int d_ad = (alf==dta) ;
+	
+	double f = d_bd*astuff; 
+	 
+	f += d_ad*bstuff;
+	f += D1[dta]*xaxb+D2[dta]*xayb;
+	f += (D3[dta]*xhat[bet]+D4[dta]*yhat[bet])*c4v[alf];
+	f += (D5[dta]*xhat[alf]+D6[dta]*c4v[alf])*c2c4 ;
+	f += D7[dta]*(d_ab-xaxb);
+
+	dv[alf][bet][dta] = f + D8[dta]*c1 ;
+      }
+    }
+  }
+  return ;
+}
+
+// returns dv[alf][bet][dta] = \partial^(x)_\alpha (\partial^(x)_\beta + \partial^(y)_\beta) < \epsilon_\delta I>_\epsilon
+__device__
+int
+chnr_dV( const double xv[4] ,
+	 const double yv[4] ,
+	 const struct invariants& Inv ,
+	 const struct Grid_coeffs& Grid ,
+	 double dv[4][4][4] )
+{
+  struct vtmp D = {} ; // zero this guy
+
+  if( Inv.x < __ldg(Grid.XX) ) {
+    // FORNOW:
+    // if( taylorx_contrib( Grid , &D , Inv.x , Inv.y , Inv.xsq ,
+    //     		 Inv.flag2 , Inv.cb ) == 1 ) {
+    //   return 1 ;
+    // }
+  } else if( Inv.x > __ldg(Grid.XX + Grid.nstpx -1 ) ) {
+    return 1 ;
+  } else {
+
+    // this one is all on its own and that is sad
+    D.dg3dy = extractff( QG3   , true , d0cb, Inv, Grid );
+    
+    // use the new extract code
+    double f[4];
+    extractff2( QG2 , d0cb , Inv , Grid , f ) ;
+    D.g2    = f[3] ;
+    D.dg2dy = f[2] ;
+
+    extractff2( dxQG2 , d0cb , Inv , Grid , f ) ;
+    D.ddg2dxdx  = f[1] ;
+    D.dg2dx     = f[3] ;
+    D.ddg2dxdy  = f[2] ;
+    D.ddg2dxdcb = f[0] ;
+
+    extractff2( dxQG3 , d0cb , Inv , Grid , f ) ;
+    D.ddg3dxdx  = f[1] ;
+    D.dg3dx     = f[3] ;
+    D.ddg3dxdy  = f[2] ;
+    D.ddg3dxdcb = f[0] ;
+    
+    extractff2( QG2 , d1cb , Inv , Grid , f ) ;
+    D.dg2dcb     = f[3] ;
+    D.ddg2dydcb  = f[2] ;
+    D.ddg2dcbdcb = f[0] ;
+
+    extractff2( QG3 , d1cb , Inv , Grid , f ) ;
+    D.dg3dcb     = f[3] ;
+    D.ddg3dydcb  = f[2] ;
+    D.ddg3dcbdcb = f[0] ;
+
+    D.dg1dx  = D.dg3dx + Inv.y/Inv.xsq*Inv.cb*D.g2 - Inv.y/Inv.x*Inv.cb*D.dg2dx;
+    D.dg1dy  = D.dg3dy - Inv.cb/Inv.x*D.g2 -(Inv.y/Inv.x)*Inv.cb*D.dg2dy;
+    D.dg1dcb = D.dg3dcb - Inv.y/Inv.x*D.g2 - Inv.y/Inv.x*Inv.cb*D.dg2dcb;
+    
+    D.ddg1dxdx   =  D.ddg3dxdx
+      - 2.0*Inv.y/(Inv.xsq*Inv.x)*Inv.cb*D.g2
+      + Inv.y/Inv.xsq*Inv.cb*D.dg2dx
+      + Inv.y/Inv.xsq*Inv.cb*D.dg2dx
+      - Inv.y/Inv.x*Inv.cb*D.ddg2dxdx;
+
+    D.ddg1dxdy   = D.ddg3dxdy +Inv.cb/Inv.xsq*D.g2
+      + Inv.y*Inv.cb/Inv.xsq*D.dg2dy
+      - Inv.cb/Inv.x*D.dg2dx
+      - Inv.y/Inv.x*Inv.cb*D.ddg2dxdy;
+
+    D.ddg1dxdcb  = D.ddg3dxdcb
+      + Inv.y/Inv.xsq*D.g2
+      + Inv.y/Inv.xsq*Inv.cb*D.dg2dcb
+      - Inv.y/Inv.x*D.dg2dx
+      - Inv.y/Inv.x*Inv.cb*D.ddg2dxdcb;
+    
+    D.ddg1dydcb  = D.ddg3dydcb
+      - D.g2/Inv.x
+      - Inv.cb/Inv.x*D.dg2dcb
+      - Inv.y/Inv.x*D.dg2dy
+      - Inv.y/Inv.x*Inv.cb*D.ddg2dydcb;
+    
+    D.ddg1dcbdcb = D.ddg3dcbdcb
+      - 2.0*Inv.y/Inv.x*D.dg2dcb
+      - Inv.y/Inv.x*Inv.cb*D.ddg2dcbdcb;
+      
+    if( Inv.flag2 ) {
+      // in case of swap, you need the second derivative wrt y
+      const int iy1 = find_ind( Grid.YY , Inv.y , 0 , Grid.nstpy ) ;
+
+      if( iy1 == Grid.nstpy-1 ) {
+	      return 1 ;
+      }
+      
+      struct invariants Inv1 = Inv , Inv2 = Inv ;
+      Inv1.y = __ldg(Grid.YY+iy1) ;
+      Inv2.y = __ldg(Grid.YY+iy1+1) ;
+      
+      double fq1 = extractff( QG2, true, d0cb, Inv1, Grid );
+      double fq2 = extractff( QG2, true, d0cb, Inv2, Grid );
+      D.ddg2dydy = (fq2-fq1)/Grid.ystp;
+      
+      fq1 = extractff( QG3, true, d0cb, Inv1, Grid );
+      fq2 = extractff( QG3, true, d0cb, Inv2, Grid );
+      const double ddg3dydy = (fq2-fq1)/Grid.ystp; 
+      D.ddg1dydy = ddg3dydy -(Inv.y*D.ddg2dydy+2.0*D.dg2dy)*Inv.cb/Inv.x;
+    }
+  }
+  
+  if( Inv.flag2) {
+    // here, convert the derivatives of g2(x,ca,xmy) into the derivatives of g2(x,cb,y)
+    // FORNOW
+    // XMYSWAP_V_contrib2( &D , Inv.x , Inv.xmy , Inv.yorig ,
+    //     	       Inv.xsq , Inv.xmysq , Inv.ysq ,
+    //     	       Inv.cb , Inv.cborig ) ;
+  } 
+  
+  get_dv( Inv.x , xv , Inv.yorig , yv , Inv.cborig , D , dv ) ;
+
+  return 0 ;
+}
+
+// check that a 4-vector is zero
+__device__
+static inline bool
+is_zero( const double x[4] )
+{
+  return (x[0]*x[0]+x[1]*x[1]+x[2]*x[2]+x[3]*x[3]) < 1E-28 ;
+}
+
+// check if x vector is equal to y vector
+__device__
+static inline bool
+x_is_y( const double x[4] ,
+	const double y[4] )
+{
+  const double xmy[4] = {x[0]-y[0],x[1]-y[1],x[2]-y[2],x[3]-y[3]} ;
+  return is_zero( xmy ) ;
+}
+
+
+// L0 is the standard version of the kernel
+__device__
+void
+my_QED_kernel_L0(
+    const double xv[4] , const double yv[4] , const struct QED_kernel_temps& t ,
+    double S, double kerv[6][4][4][4] )
+{
+  const bool x_is_zero  = is_zero( xv ) ;
+  const bool y_is_zero  = is_zero( yv ) ;
+
+  // do the logic
+  if( x_is_zero && y_is_zero ) {
+    return ;
+  }
+  if( x_is_zero ) {
+    kernelQED_xoryeq0_axpy( yv , t , kerv , S, false, KQED_TABD_XEQ0 ) ;
+    return ;
+  }
+  if( y_is_zero ) {
+    kernelQED_xoryeq0_axpy( xv , t , kerv , S, false, KQED_TABD_YEQ0 ) ;
+    return ;
+  }
+  if( x_is_y( xv , yv ) ) {
+    kernelQED_xoryeq0_axpy( xv , t , kerv , S, true /* mulam_minus */, KQED_TABD_YEQ0 ) ;
+    return ;
+  }
+  
+  // if neither are zero or small we do the standard one
+  // TODO:
+  // kernelQED_axpy( xv , yv , t , S , kerv ) ;
+  
+  return ;
+}
+
+__device__
+int
+init_STV( const double xv[4] ,
+	  const double yv[4] ,
+	  const struct QED_kernel_temps& t ,
+	  struct STV *k )
+{
+  struct invariants Inv;
+  set_invariants( xv , yv , t.Grid, Inv ) ;
+  // const struct invariants Inv = set_invariants( xv , yv , t.Grid ) ;
+
+  // Not needed
+  // memset( k -> Sxv , 0 , 4*sizeof( double ) ) ;
+  // memset( k -> Syv , 0 , 4*sizeof( double ) ) ;
+  // memset( k -> Txv , 0 , 64*sizeof( double ) ) ;
+  // memset( k -> Tyv , 0 , 64*sizeof( double ) ) ;
+  // memset( k -> Vv  , 0 , 64*sizeof( double ) ) ;
+
+  // precompuations for the interpolations
+  const size_t ix1 = Inv.INVx.idx ;
+  size_t ix2 = ix1+1 ;
+  if( ix2 >= (size_t)t.Grid.nstpx ) {
+    ix2 = ix1 ;
+  }
+
+  if( chnr_dS( xv, yv, Inv, t.Grid, k->Sxv, k->Syv ) ||
+      chnr_dT( xv, yv, Inv, t.Grid, k->Txv, k->Tyv ) ||
+      chnr_dV( xv, yv, Inv, t.Grid, k->Vv ) ) {
+    return 1 ;
+  }
+
+  return 0 ;
+}
+
 
 __device__
 void KQED_LX(
     int ikernel, const double xm[4], const double ym[4],
-    const struct QED_kernel_temps kqed_t, double kerv[6][4][4][4]) {
+    const struct QED_kernel_temps& kqed_t, double kerv[6][4][4][4]) {
 #if CUDA_N_QED_KERNEL != 2
   #error "Number of QED kernels does not match implementation"
 #endif
+  // FFs of QED kernel and their derivatives wrt x,cb,y
+  struct STV x_y;
+  assert(init_STV( xm, ym, kqed_t, &x_y ) == 0);
   if (ikernel == 0) {
-    QED_kernel_L3( xm, ym, kqed_t, kerv );
+    // QED_kernel_L3( xm, ym, kqed_t, kerv );
+    // FORNOW
+    /*
+    const double zero[4] = { 0 , 0 , 0 , 0 } ;
+    my_QED_kernel_L0( xm , ym , kqed_t , 1.0, kerv ) ;
+    my_QED_kernel_L0( xm , xm , kqed_t , -1.0, kerv) ;
+    my_QED_kernel_L0( zero , xm , kqed_t , 1.0, kerv ) ;
+    my_QED_kernel_L0( zero , ym , kqed_t , -1.0, kerv ) ;
+    */
+    kernelQED_axpy( xm , ym , kqed_t , x_y, 1.0, kerv ) ;
   }
   else {
-    QED_Mkernel_L2( 0.4, xm, ym, kqed_t, kerv );
+    // QED_Mkernel_L2( 0.4, xm, ym, kqed_t, kerv );
+    kernelQED_axpy( xm , ym , kqed_t , x_y, 1.0, kerv ) ;
+    // TODO:
+    // const double M = 0.4;
+    // my_QED_kernel_L0( xm, ym, kqed_t, 1.0, kerv ) ;
+    // const double gaussX = exp( -M*(xm[0]*xm[0]+xm[1]*xm[1]+
+    //                                xm[2]*xm[2]+xm[3]*xm[3] )/2. ) ;
+    // const double gaussY = exp( -M*(ym[0]*ym[0]+ym[1]*ym[1]+
+    //                                ym[2]*ym[2]+ym[3]*ym[3] )/2. ) ;
+    // const double kt[6][4][4][4] = { 0 } ;
+    // const double zero[4] = { 0 , 0 , 0 , 0 } ;
+    // my_QED_kernel_L0( zero, ym, kqed_t, 1.0, kt );
+    // for (int k = 0; k < 6; ++k) {
+    //   for (int mu = 0; mu < 4; ++mu) {
+    //     for (int nu = 0; nu < 4; ++nu) {
+    //       for (int lambda = 0; lambda < 4; ++lambda) {
+    //         kerv[k][mu][nu][lambda] -=
+    //             gaussX * (
+    //                 kt[k][mu][nu][lambda] -
+    //                 M * xm[mu] * ( xm[0]*kt[k][0][nu][lambda] +
+    //                                xm[1]*kt[k][1][nu][lambda] +
+    //                                xm[2]*kt[k][2][nu][lambda] +
+    //                                xm[3]*kt[k][3][nu][lambda] ) ) ;
+    //       }
+    //     }
+    //   }
+    // }
+    // for (int k = 0; k < 6; ++k) {
+    //   for (int mu = 0; mu < 4; ++mu) {
+    //     for (int nu = 0; nu < 4; ++nu) {
+    //       for (int lambda = 0; lambda < 4; ++lambda) {
+    //         kt[k][mu][nu][lambda] = 0;
+    //       }
+    //     }
+    //   }
+    // }
+    // my_QED_kernel_L0( xm, zero, kqed_t, 1.0, kt );
+    // for (int k = 0; k < 6; ++k) {
+    //   for (int mu = 0; mu < 4; ++mu) {
+    //     for (int nu = 0; nu < 4; ++nu) {
+    //       for (int lambda = 0; lambda < 4; ++lambda) {
+    //         kerv[k][mu][nu][lambda] -=
+    //             gaussY * (
+    //                 kt[k][mu][nu][lambda] -
+    //                 M * ym[nu] * ( ym[0]*kt[k][mu][0][lambda] +
+    //                                ym[1]*kt[k][mu][1][lambda] +
+    //                                ym[2]*kt[k][mu][2][lambda] +
+    //                                ym[3]*kt[k][mu][3][lambda] ) ) ;
+    //       }
+    //     }
+    //   }
+    // }
   }
 }
 
@@ -282,7 +1636,7 @@ void ker_4pt_contraction(
 
   double kernel_sum_work[CUDA_N_QED_KERNEL] = { 0 };
   double spinor_work_0[24], spinor_work_1[24];
-  double kerv[6][4][4][4] KQED_ALIGN = { 0 };
+  double kerv[6][4][4][4] = { 0 };
 
   for (int ix = blockIdx.x * blockDim.x + threadIdx.x;
        ix < VOLUME; ix += blockDim.x * gridDim.x) {
@@ -474,7 +1828,7 @@ void ker_2p2_pieces(
 
   double pimn[4][4];
   double spinor_work_0[24], spinor_work_1[24];
-  double kerv[6][4][4][4] KQED_ALIGN = { 0 };
+  double kerv[6][4][4][4] = { 0 };
 
   for (int ix = blockIdx.x * blockDim.x + threadIdx.x;
        ix < VOLUME; ix += blockDim.x * gridDim.x) {
@@ -620,6 +1974,7 @@ void ker_2p2_pieces(
         xv_mi_yv[3] * xunit.a
       };
 
+      #pragma unroll
       for (int ikernel = 0; ikernel < CUDA_N_QED_KERNEL; ++ikernel) {
         double local_P2[4][4][4] = { 0 };
         double local_P3[4][4][4] = { 0 };
@@ -631,7 +1986,10 @@ void ker_2p2_pieces(
             local_P2[rho][sigma][nu] = 0.0;
             for ( int mu = 0; mu < 4; mu++ ) {
               for ( int lambda = 0; lambda < 4; lambda++ ) {
+                // FORNOW:
+                // kerv[k][mu][nu][lambda] = (xm[mu] - ym[mu]) * (xm[nu] - ym[nu]) + lambda;
                 local_P2[rho][sigma][nu] += kerv[k][mu][nu][lambda] * pimn[mu][lambda];
+                kerv[k][mu][nu][lambda] = 0.0;
               }
             }
           }
@@ -643,7 +2001,10 @@ void ker_2p2_pieces(
           for ( int mu = 0; mu < 4; mu++ ) {
             for ( int nu = 0; nu < 4; nu++ ) {
               for ( int lambda = 0; lambda < 4; lambda++ ) {
+                // FORNOW:
+                // kerv[k][mu][nu][lambda] += k * (xm[nu] - ym[nu]) * (xm[nu] - ym[nu]);
                 local_P2[rho][sigma][nu] += kerv[k][nu][mu][lambda] * pimn[mu][lambda];
+                kerv[k][mu][nu][lambda] = 0.0;
               }
             }
           }
@@ -656,7 +2017,10 @@ void ker_2p2_pieces(
             local_P3[rho][sigma][nu] = 0.0;
             for ( int mu = 0; mu < 4; mu++ ) {
               for ( int lambda = 0; lambda < 4; lambda++ ) {
+                // FORNOW:
+                // kerv[k][mu][nu][lambda] += (xm[mu] - ym[mu]) * (xm[nu] - ym[mu]) - k;
                 local_P3[rho][sigma][nu] += kerv[k][mu][lambda][nu] * pimn[mu][lambda];
+                kerv[k][mu][nu][lambda] = 0.0;
               }
             }
           }
